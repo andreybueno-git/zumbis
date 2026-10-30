@@ -24,7 +24,7 @@
 <link rel="icon" href="favicon.svg?v=89cfc6d5" type="image/svg+xml">
 <link rel="icon" href="icon-32.png?v=822b96b3" sizes="32x32" type="image/png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png?v=653568c8">
-<link rel="manifest" href="manifest.webmanifest?v=0f25de22">
+<link rel="manifest" href="manifest.webmanifest?v=806565dc">
 <link rel="preload" href="fonts/vt323-latin.woff2?v=bf182d50" as="font" type="font/woff2" crossorigin>
 <style>
 @font-face {
@@ -37,6 +37,8 @@ html, body {
   margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
   background: #05070c; color: #f4ead0;
   font-family: "VT323", "Courier New", monospace;
+  /* sem ligaduras: a VT323 junta "fi" num glifo só ("sem fim" virava "sem ﬁm") */
+  font-variant-ligatures: none; font-feature-settings: "liga" 0, "clig" 0;
   touch-action: none; -webkit-user-select: none; user-select: none;
   -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
 }
@@ -64,6 +66,8 @@ button:focus-visible { outline: 2px solid #ffd36e; outline-offset: 2px; }
 }
 #barra button { font-size: 20px; padding: 8px 10px; background: rgba(10, 14, 28, 0.82); }
 body[data-jogando="1"] #barra { display: none; }
+/* com um menu do jogo na tela (zumbis-ui.js), a barra sai: o menu tem SOM, TELA CHEIA e VIRAR */
+body[data-tela]:not([data-tela=""]) #barra { display: none; }
 #gire .celular {
   justify-self: center; width: 46px; height: 78px; border: 4px solid #f4ead0; border-radius: 9px; box-sizing: border-box;
   animation: girar 1.2s ease-in-out infinite alternate;
@@ -125,8 +129,15 @@ body[data-jogando="1"] #barra { display: none; }
   </div>
 </div>
 <noscript><div class="quadro"><p class="forte">NOITE DOS ZUMBIS</p><p>Ligue o JavaScript para jogar.</p></div></noscript>
-<script src="audio.js?v=0c231148" defer></script>
-<script src="zumbis.js?v=13fb2609" defer></script>
-<script src="jogo.js?v=891a2c89" defer></script>
+<script src="audio.js?v=f5b50fba" defer></script>
+<script src="zumbis-dados.js?v=0bf5a373" defer></script>
+<script src="zumbis-arte.js?v=63ab8735" defer></script>
+<script src="zumbis-save.js?v=971aefa0" defer></script>
+<script src="zumbis-nucleo.js?v=9ff908c0" defer></script>
+<script src="zumbis-cena.js?v=8c8e79f6" defer></script>
+<script src="zumbis-ui-base.js?v=b583550d" defer></script>
+<script src="zumbis-ui.js?v=7c3e5892" defer></script>
+<script src="zumbis.js?v=55f1d6d4" defer></script>
+<script src="jogo.js?v=aae4fa32" defer></script>
 </body>
 </html>

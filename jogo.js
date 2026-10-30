@@ -1,52 +1,40 @@
-/*
- * jogo.js — a página sozinha da NOITE DOS ZUMBIS (andreybueno-git.github.io/zumbis/).
- *
- * Liga o motor (zumbis.js) ao som (audio.js) e cuida do que o AndreyOS fazia em volta dele:
- *   - teclado da página inteira repassado ao jogo (o motor não tem listener global);
- *   - celular em pé: tela GIRE O CELULAR com JOGAR EM PÉ, que gira o palco 90° por CSS
- *     (VIRAR troca o sentido); a escolha fica em andreyos.zumbis.opcoes;
- *   - som só depois do primeiro toque ou tecla; no iPhone, audioSession 'playback' e um
- *     <audio> mudo para o interruptor de silêncio não calar o Web Audio;
- *   - tela cheia (botão ou F), mudo (botão ou M), tela acesa enquanto joga;
- *   - voltar do navegador durante a partida pausa em vez de sair;
- *   - ?perf=1 mostra o p95 do intervalo entre quadros.
- * Nada aqui muda regra de jogo: é o jogo de hoje, no link que não muda mais.
- */
+// jogo.js: cópia sem comentários; o fonte comentado mora no AndreyOS (andreyos-teaser/zumbis/jogo.js).
 (function (global) {
   'use strict';
-
   var doc = global.document;
   var $ = function (id) { return doc.getElementById(id); };
   var OPCOES = 'andreyos.zumbis.opcoes';
-  var SFX = { shot: 'click', hit: 'key', hurt: 'error', wave: 'beep', pickup: 'boot', empty: 'error', gameover: 'off', record: 'win' };
-
+  var SFX = { shot: 'click', hit: 'key', hurt: 'error', wave: 'beep', pickup: 'boot', empty: 'error', gameover: 'off', record: 'win',
+    coin: 'key', 'switch': 'click', shop: 'beep', buy: 'win', upgrade: 'win', undo: 'click', equip: 'click', deny: 'error' };
+  var BASE = global.location.origin + global.location.pathname;
+  var VIA_ZAP = /[?&]via=zap\b/.test(global.location.search);
+  function instalado() {
+    try { return global.matchMedia('(display-mode: standalone)').matches || global.matchMedia('(display-mode: fullscreen)').matches || global.navigator.standalone === true; } catch (e) { return false; }
+  }
   if (!global.AndreyZumbis) { if (global.__zmbFalha) global.__zmbFalha('Faltou: zumbis.js'); return; }
-
   function lerOpcoes() {
     try { var o = JSON.parse(global.localStorage.getItem(OPCOES) || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e) { return {}; }
   }
-  function gravarOpcoes(o) {
-    try { global.localStorage.setItem(OPCOES, JSON.stringify(o)); } catch (e) { /* sem armazenamento: vale só nesta visita */ }
+  function gravarOpcoes(mudou) {
+    var o = lerOpcoes();
+    Object.keys(mudou).forEach(function (k) { o[k] = mudou[k]; });
+    try { global.localStorage.setItem(OPCOES, JSON.stringify(o)); } catch (e) {   }
   }
   var opcoes = lerOpcoes();
-
-  /* ---------- som ---------- */
   var audio = global.AndreyAudio ? global.AndreyAudio.create({ storageKey: 'andreyos.zumbis.som' }) : null;
   var liberado = false, avisouSilencio = false;
   var mudo = null;
   function liberarSom() {
     if (liberado || !audio) return;
     liberado = true;
-    // iPhone: sem isso o Web Audio obedece ao interruptor de silêncio (Safari 16.4 ou mais novo)
     var nav = global.navigator, sessao = false;
-    try { if (nav.audioSession) { nav.audioSession.type = 'playback'; sessao = true; } } catch (e) { /* navegador sem audioSession */ }
+    try { if (nav.audioSession) { nav.audioSession.type = 'playback'; sessao = true; } } catch (e) {   }
     var ios = /iP(hone|ad|od)/.test(nav.userAgent) || (nav.platform === 'MacIntel' && nav.maxTouchPoints > 1);
     if (ios && !sessao) try {
-      // 0,25 s de silêncio de verdade (no iPhone o volume do <audio> não muda por código)
       mudo = new global.Audio('silencio.wav');
       mudo.loop = true; mudo.setAttribute('playsinline', '');
       var p = mudo.play(); if (p && p.catch) p.catch(function () {});
-    } catch (e) { /* reserva opcional */ }
+    } catch (e) {   }
     audio.unlock();
     global.setTimeout(function () {
       var d = audio._debug ? audio._debug() : null;
@@ -60,7 +48,6 @@
     var d = audio._debug ? audio._debug() : null;
     if (d && d.ctx && d.ctx !== 'running') audio.unlock();
   }, true);
-
   function syncSom() {
     var on = audio ? audio.isOn() : false;
     var b = $('b-som');
@@ -68,46 +55,55 @@
     b.textContent = on ? 'SOM' : 'SEM SOM';
     b.setAttribute('aria-pressed', String(on));
     b.setAttribute('aria-label', on ? 'Som ligado. Toque para desligar.' : 'Som desligado. Toque para ligar.');
+    if (api && api.ui && api.ui.redesenhar) api.ui.redesenhar();
   }
   function alternarSom() { if (!audio) return; liberarSom(); audio.toggle(); syncSom(); }
-
-  /* ---------- recado curto na tela ---------- */
   var recadoT = 0;
   function recado(t, ms) {
     var r = $('recado'); r.textContent = t; r.hidden = false;
     global.clearTimeout(recadoT);
     recadoT = global.setTimeout(function () { r.hidden = true; }, ms || 2500);
   }
-
-  /* ---------- tela acesa ---------- */
   var trava = null, soltarT = 0;
   function pedirTela() {
     global.clearTimeout(soltarT);
     if (trava || !global.navigator.wakeLock || doc.hidden) return;
     global.navigator.wakeLock.request('screen').then(function (t) {
       trava = t; t.addEventListener('release', function () { trava = null; });
-    }, function () { /* negado: segue sem */ });
+    }, function () {   });
   }
   function soltarTelaDepois(ms) {
     global.clearTimeout(soltarT);
     soltarT = global.setTimeout(function () { if (trava) { trava.release().catch(function () {}); trava = null; } }, ms);
   }
-
-  /* ---------- o jogo ---------- */
-  var jogando = false, empilhou = false;
+  var jogando = false;
   function marcarJogando(v) {
     jogando = v;
     doc.body.setAttribute('data-jogando', v ? '1' : '0');
     if (audio) audio.music(v);
     if (v) pedirTela(); else soltarTelaDepois(60000);
   }
+  var el = doc.documentElement;
+  var podeCheia = !!(el.requestFullscreen || el.webkitRequestFullscreen);
   var api = global.AndreyZumbis.create($('jogo'), {
     escFecha: false,
+    modo: 'semfim',
+    ui: {
+      linkBase: BASE, linkLimpo: BASE, faixaZap: VIA_ZAP && !instalado(),
+      som: audio ? { alternar: function () { alternarSom(); return audio.isOn(); }, ligado: function () { return audio.isOn(); } } : null,
+      telaCheia: podeCheia ? function () { telaCheia(); } : null,
+      virar: { disponivel: function () { return doc.body.getAttribute('data-girado') === '1'; }, virar: virar }
+    },
     onEvent: function (kind, detail) {
       if (audio && SFX[kind]) audio.sfx(SFX[kind]);
+      if (kind === 'ui') {
+        if (detail.acao === 'clique' && audio) audio.sfx('click');
+        if (detail.acao === 'tela') { doc.body.setAttribute('data-tela', detail.tela || ''); garantirGuarda(); }
+      }
+      if (kind === 'shop') { if (detail.aberta) soltarTelaDepois(90000); else if (api && api.isRunning()) pedirTela(); garantirGuarda(); }
       if (kind === 'start' || kind === 'resume') {
         marcarJogando(true);
-        if (!empilhou) { empilhou = true; try { global.history.pushState({ zmb: 1 }, ''); } catch (e) { /* sem history */ } }
+        garantirGuarda();
       } else if (kind === 'pause' || kind === 'gameover') {
         marcarJogando(false);
       }
@@ -115,22 +111,28 @@
   });
   var carregando = $('carregando'); if (carregando && carregando.parentNode) carregando.parentNode.removeChild(carregando);
   global.__zmbOk = true;
-  global.__zmb = api;          // para os testes da página
+  global.__zmb = api;
   $('barra').hidden = false;
   syncSom();
   api.focus();
-
-  // Voltar do Android, gesto de borda do iPhone ou botão voltar: pausa a partida em vez de sair.
+  var empilhou = false;
+  function precisaGuarda() {
+    if (!api) return false;
+    if (api.isRunning()) return true;
+    var t = api.ui ? api.ui.tela() : '';
+    return !!t && t !== 'titulo';
+  }
+  function garantirGuarda() {
+    if (empilhou || !precisaGuarda()) return;
+    empilhou = true;
+    try { global.history.pushState({ zmb: 1 }, ''); } catch (e) { empilhou = false; }
+  }
   global.addEventListener('popstate', function () {
     empilhou = false;
-    if (api.isRunning()) {
-      api.pause();
-      empilhou = true;
-      try { global.history.pushState({ zmb: 1 }, ''); } catch (e) { /* sem history */ }
-    }
+    if (api.isRunning()) api.pause();
+    else if (api.ui) api.ui.voltar();
+    garantirGuarda();
   });
-
-  /* ---------- teclado da página inteira ---------- */
   function deFora(e) { return !api.el.contains(e.target) && !(e.target && e.target.tagName === 'BUTTON'); }
   doc.addEventListener('keydown', function (e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -149,32 +151,23 @@
     if (e.target && e.target.tagName === 'BUTTON') return;
     api.focus();
   });
-
-  /* ---------- tela cheia ---------- */
-  var el = doc.documentElement;
-  var podeCheia = !!(el.requestFullscreen || el.webkitRequestFullscreen);
   function telaCheia() {
     try {
       if (doc.fullscreenElement || doc.webkitFullscreenElement) { (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc); return; }
       var p = el.requestFullscreen ? el.requestFullscreen({ navigationUI: 'hide' }) : el.webkitRequestFullscreen();
       if (p && p.then) p.then(function () {
-        try { if (global.screen.orientation && global.screen.orientation.lock) global.screen.orientation.lock('landscape').catch(function () {}); } catch (e) { /* sem trava */ }
+        try { if (global.screen.orientation && global.screen.orientation.lock) global.screen.orientation.lock('landscape').catch(function () {}); } catch (e) {   }
       }, function () {});
-    } catch (e) { /* tela cheia negada */ }
+    } catch (e) {   }
   }
   $('b-cheia').hidden = !podeCheia;
-
-  /* ---------- botões ---------- */
   $('b-som').addEventListener('click', function () { alternarSom(); api.focus(); });
   $('b-cheia').addEventListener('click', function () { telaCheia(); api.focus(); });
-  $('b-virar').addEventListener('click', function () {
-    opcoes.sentido = opcoes.sentido === -1 ? 1 : -1; gravarOpcoes(opcoes); ajustar(); api.focus();
-  });
+  function virar() { opcoes.sentido = opcoes.sentido === -1 ? 1 : -1; gravarOpcoes({ sentido: opcoes.sentido }); ajustar(); api.focus(); }
+  $('b-virar').addEventListener('click', virar);
   $('b-empe').addEventListener('click', function () {
-    opcoes.emPe = true; gravarOpcoes(opcoes); ajustar(); api.focus();
+    opcoes.emPe = true; gravarOpcoes({ emPe: true }); ajustar(); api.focus();
   });
-
-  /* ---------- deitado, em pé ou girado ---------- */
   var toque = !!(global.matchMedia && global.matchMedia('(pointer: coarse)').matches);
   var palco = $('palco');
   function ajustar() {
@@ -190,7 +183,6 @@
       palco.style.width = ''; palco.style.height = ''; palco.style.transform = '';
     }
     doc.body.setAttribute('data-girado', girado ? '1' : '0');
-    // girar o aparelho no meio da partida pausa (a mão muda de lugar)
     if (api.isRunning() && ultimoEmPe !== null && ultimoEmPe !== emPe) api.pause();
     ultimoEmPe = emPe;
   }
@@ -198,13 +190,21 @@
   global.addEventListener('resize', ajustar);
   global.addEventListener('orientationchange', function () { global.setTimeout(ajustar, 120); });
   ajustar();
-
   doc.addEventListener('visibilitychange', function () {
     if (audio) audio.setPaused(doc.hidden);
     if (!doc.hidden && jogando) pedirTela();
   });
-
-  /* ---------- ?perf=1 ---------- */
+  try {
+    var mr = /(?:^#|&)r=([^&]+)/.exec(global.location.hash);
+    if (mr && api.ui) {
+      var codigo = mr[1];
+      try { codigo = decodeURIComponent(codigo); } catch (e) {   }
+      api.ui.oferecerRestauro(codigo, function (ok, motivo) {
+        if (motivo === 'naoRestaurou') return;
+        try { global.history.replaceState(global.history.state, '', global.location.pathname + global.location.search); } catch (e) {   }
+      });
+    }
+  } catch (e) { if (global.console) global.console.warn('[ZUMBIS] o link de backup não abriu:', e); }
   if (/[?&]perf=1\b/.test(global.location.search)) {
     var box = doc.createElement('div'); box.id = 'perf'; palco.appendChild(box);
     var marcas = [], ult = 0;

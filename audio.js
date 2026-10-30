@@ -1,83 +1,36 @@
-/*
- * audio.js — a trilha e os efeitos do AndreyOS, sintetizados na hora com Web Audio.
- * Nada de arquivo de áudio, amostra ou serviço externo: cada som nasce de osciladores e ruído.
- *
- * Contrato:
- *   AndreyAudio.create({ storageKey: 'andreyos.som' }) -> api
- *   api.unlock()         chamar dentro de um gesto do visitante: cria ou retoma o AudioContext.
- *                        Antes disso nada toca; as outras chamadas só guardam a intenção.
- *   api.setOn(bool)      liga/desliga TODO o som (música + efeitos) com fade de 300 ms e guarda a escolha
- *   api.isOn()           sem nada guardado (ou sem storage), o padrão é ligado
- *   api.toggle()         inverte e devolve o novo estado
- *   api.music(play)      começa ou para a trilha (para com fade curto; começar de novo não duplica vozes).
- *                        Pedida antes do unlock, ela começa sozinha quando o som for liberado.
- *   api.sfx(nome)        'power' | 'beep' | 'key' | 'boot' | 'off' | 'click' | 'error' | 'win'
- *   api.setPaused(bool)  aba oculta: suspende o contexto e o agendador; ao voltar segue de onde parou,
- *                        sem pular nem amontoar notas (a aba oculta também pausa sozinha)
- *   api.dispose()
- *
- * Sem AudioContext no navegador tudo vira no-op (isOn/setOn/toggle continuam guardando a escolha).
- * opts.contextOptions vai direto para o construtor do AudioContext (o teste em dev/ usa sinkId 'none').
- *
- * A trilha: lo-fi de madrugada em Dó maior, 76 BPM, 16 compassos (≈ 50,5 s) que se repetem:
- *   Fmaj9 · Em7 · Dm9 · Cmaj9 | Fmaj9 · Em7 · Dm9 · G9sus4→G13 |
- *   Am9 · Em7 · Fmaj7 · E7(b9) | Am9 · Dm9 · Fm6 · Cmaj9→C9   (o C9 puxa de volta para o Fá)
- * Piano elétrico FM com tremolo, baixo redondo, um lead de onda de pulso filtrada (chip de PC antigo),
- * bumbo macio, aro e chimbal de ruído com swing, e um chiado de vinil bem baixo. O piano e o lead
- * passam por um "wow" de fita (atraso modulado) que também abre o estéreo.
- * A primeira volta tem 2 compassos de introdução; depois, três arranjos se revezam a cada volta.
- * O agendador nunca "volta ao começo": ele só conta semicolcheias, então a emenda é contínua.
- * Volume de fundo de site (medido em dev/audio-harness.html): trilha ≈ −24,5 dBFS RMS e pico ≈ −7 dBFS;
- * um limitador acima de −6 dBFS segura a soma rara de efeito com pico da música.
- *
- * Para o harness de dev/: AndreyAudio._engine(ctx) monta o mesmo grafo num OfflineAudioContext.
- */
+// audio.js: cópia sem comentários; o fonte comentado mora no AndreyOS (andreyos-teaser/audio.js).
 (function (global) {
   'use strict';
-
   const AC = global.AudioContext || global.webkitAudioContext;
   const noop = function () {};
-
-  /* ------------------------------------------------------------------ */
-  /* Tempo, grade e níveis                                               */
-  /* ------------------------------------------------------------------ */
-
   const BPM = 76;
   const BEAT = 60 / BPM;
-  const STEP = BEAT / 4;                  // uma semicolcheia
+  const STEP = BEAT / 4;
   const BAR = BEAT * 4;
   const LOOP_BARS = 16;
   const LOOP_STEPS = LOOP_BARS * 16;
-  const LOOP_SECONDS = LOOP_BARS * BAR;   // ≈ 50,53 s
-  const SWING = 0.08;                     // a 2ª colcheia de cada tempo chega 8% de tempo atrasada
+  const LOOP_SECONDS = LOOP_BARS * BAR;
+  const SWING = 0.08;
   const SLOT = [0, 0.25 + SWING / 2, 0.5 + SWING, 0.75 + SWING / 2];
-  const WOW_DELAY = 0.0155;               // atraso médio do wow de fita (piano e lead saem antes para compensar)
-  const LOOKAHEAD = 0.3;                  // quanto o agendador ao vivo enxerga à frente (s)
+  const WOW_DELAY = 0.0155;
+  const LOOKAHEAD = 0.3;
   const TICK_MS = 50;
-  const TONE_HZ = 8500;                   // o teto do som da trilha: quente, sem brilho digital
-  const OUT_TRIM = 0.62;                  // volume geral (medido no harness: fundo de site, picos abaixo do limitador)
-  const LIMITER_MAKEUP_UNDO = 0.745;      // 1 / ganho de compensação do limitador (+2,56 dB, medido no harness)
-  // Equilíbrio da mistura (pico de cada instrumento), acertado com as medidas por instrumento do harness.
+  const TONE_HZ = 8500;
+  const OUT_TRIM = 0.62;
+  const LIMITER_MAKEUP_UNDO = 0.745;
   const EP_LEVEL = 0.1, LEAD_LEVEL = 0.1, BASS_LEVEL = 0.09, KICK_LEVEL = 0.38, RIM_LEVEL = 2.5, HAT_LEVEL = 0.12;
   const FADE_ONOFF = 0.3;
   const FADE_MUSIC_IN = 1.2;
   const FADE_MUSIC_OUT = 0.25;
-
-  // Nível de cada efeito (multiplica a voz inteira) e quanto dele vai para o eco curto.
   const SFX_LEVEL = { power: 1.2, beep: 2.3, key: 0.42, boot: 1.45, off: 1, click: 1.4, error: 1.9, win: 1.7 };
   const SFX_ECHO = { boot: 0.55, win: 0.45, beep: 0.2, error: 0.15 };
-  // Polifonia: no máximo N vozes do mesmo efeito e 8 no total; a mais velha sai com fade curto.
   const SFX_CAP = { key: 4, click: 3, beep: 3 };
   const SFX_CAP_DEFAULT = 2;
   const SFX_CAP_TOTAL = 8;
-  // Chamadas repetidas do mesmo efeito mais perto que isso (s) viram uma só (ex.: 30 teclas no mesmo instante).
   const SFX_MIN_GAP = { key: 0.025, click: 0.03 };
   const SFX_MIN_GAP_DEFAULT = 0.06;
-
-  // Tempo da semicolcheia s (contada desde o começo da trilha). Calculado, nunca acumulado: sem deriva.
   function stepOffset(s) { return Math.floor(s / 4) * BEAT + SLOT[s % 4] * BEAT; }
   function hz(m) { return 440 * Math.pow(2, (m - 69) / 12); }
-  // Pseudoaleatório determinístico: a mesma trilha toda vez (e o harness mede exatamente o que toca).
   function hash(n) {
     let x = (n | 0) ^ 0x9e3779b9;
     x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
@@ -94,44 +47,32 @@
       return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
   }
-
-  /* ------------------------------------------------------------------ */
-  /* A música (dados)                                                    */
-  /* ------------------------------------------------------------------ */
-
-  // Cada compasso: vozes do piano (MIDI) e a fundamental do baixo; c2 troca o acorde no meio do compasso.
-  // As vozes descem em bloco (Fmaj9 → Em7 → Dm9 → Cmaj9), o jeito lo-fi de encadear sétimas.
   const BARS = [
-    { c: [57, 60, 64, 67], b: 41 },                         // 1  Fmaj9
-    { c: [55, 59, 62, 64], b: 40 },                         // 2  Em7
-    { c: [53, 57, 60, 64], b: 38 },                         // 3  Dm9
-    { c: [52, 55, 59, 62], b: 36 },                         // 4  Cmaj9
-    { c: [57, 60, 64, 67], b: 41 },                         // 5  Fmaj9
-    { c: [55, 59, 62, 64], b: 40 },                         // 6  Em7
-    { c: [53, 57, 60, 64], b: 38 },                         // 7  Dm9
-    { c: [53, 57, 60, 62], b: 43, c2: [53, 57, 59, 64] },   // 8  G9sus4 → G13
-    { c: [55, 59, 60, 64], b: 45 },                         // 9  Am9
-    { c: [55, 59, 62, 64], b: 40 },                         // 10 Em7
-    { c: [53, 57, 60, 64], b: 41 },                         // 11 Fmaj7
-    { c: [53, 56, 59, 62], b: 40 },                         // 12 E7(b9)
-    { c: [55, 59, 60, 64], b: 45 },                         // 13 Am9
-    { c: [53, 57, 60, 64], b: 38 },                         // 14 Dm9
-    { c: [53, 56, 60, 62], b: 41 },                         // 15 Fm6 (emprestado do menor: a saudade)
-    { c: [52, 55, 59, 62], b: 36, c2: [52, 55, 58, 62] }    // 16 Cmaj9 → C9
+    { c: [57, 60, 64, 67], b: 41 },
+    { c: [55, 59, 62, 64], b: 40 },
+    { c: [53, 57, 60, 64], b: 38 },
+    { c: [52, 55, 59, 62], b: 36 },
+    { c: [57, 60, 64, 67], b: 41 },
+    { c: [55, 59, 62, 64], b: 40 },
+    { c: [53, 57, 60, 64], b: 38 },
+    { c: [53, 57, 60, 62], b: 43, c2: [53, 57, 59, 64] },
+    { c: [55, 59, 60, 64], b: 45 },
+    { c: [55, 59, 62, 64], b: 40 },
+    { c: [53, 57, 60, 64], b: 41 },
+    { c: [53, 56, 59, 62], b: 40 },
+    { c: [55, 59, 60, 64], b: 45 },
+    { c: [53, 57, 60, 64], b: 38 },
+    { c: [53, 56, 60, 62], b: 41 },
+    { c: [52, 55, 59, 62], b: 36, c2: [52, 55, 58, 62] }
   ];
-
-  // Batidas do piano: [semicolcheia, duração em semicolcheias, força]
   const COMP = {
     a: [[0, 10, 1], [10, 6, 0.55]],
     b: [[0, 6, 0.95], [6, 4, 0.5], [12, 4, 0.6]],
     split: [[0, 8, 1], [8, 8, 0.85]]
   };
   const ARP = [0, 1, 2, 3, 1, 2, 3, 2];
-  // Baixo: [semicolcheia, duração, 'r' fundamental | 'g' fantasma | 'q' quinta | 'a' aproximação, força]
   const BASS = [[0, 6, 'r', 1], [7, 1, 'g', 0.45], [10, 4, 'q', 0.75], [14, 2, 'a', 0.55]];
   const BASS_LONG = [[0, 14, 'r', 0.9]];
-
-  // Frases do lead (4 compassos cada): por compasso, [semicolcheia, nota MIDI, duração].
   const MEL = {
     A: [
       [[2, 72, 2], [4, 76, 4], [10, 79, 2], [12, 76, 4]],
@@ -164,19 +105,13 @@
       [[0, 67, 8], [12, 64, 2]]
     ]
   };
-  // Que frase entra em que compasso, por arranjo. 0 = primeira volta (com introdução); 1–3 se revezam.
   const PLAN = [
     { 4: 'A', 12: 'B' },
     { 8: 'C', 12: 'B' },
-    { 4: 'A2', 12: 'B2' },          // e a quebra nos compassos 9–12 (piano dedilhado, bateria rala)
-    { 4: 'A', 8: 'C', 12: 'B' }     // e o "rádio velho": o som fecha um pouco nos compassos 9–10
+    { 4: 'A2', 12: 'B2' },
+    { 4: 'A', 8: 'C', 12: 'B' }
   ];
   function arrangement(pass) { return pass === 0 ? 0 : 1 + (pass - 1) % 3; }
-
-  /* ------------------------------------------------------------------ */
-  /* Vozes: grupinhos de nós que nascem, tocam e se desmontam sozinhos   */
-  /* ------------------------------------------------------------------ */
-
   function gainNode(ctx, v) { const n = ctx.createGain(); n.gain.value = v; return n; }
   function bq(ctx, type, f, q) {
     const n = ctx.createBiquadFilter(); n.type = type; n.frequency.value = f;
@@ -184,10 +119,9 @@
     return n;
   }
   function panner(ctx, p) {
-    if (!ctx.createStereoPanner) return gainNode(ctx, 1); // Safari antigo: fica no centro
+    if (!ctx.createStereoPanner) return gainNode(ctx, 1);
     const n = ctx.createStereoPanner(); n.pan.value = p; return n;
   }
-
   function voice(E, dest, bucket, name, level, echo) {
     const ctx = E.ctx;
     const v = { E: E, ctx: ctx, out: gainNode(ctx, level || 1), level: level || 1, nodes: [], srcs: 0, dead: false, dying: false, bucket: bucket, name: name || '', t0: ctx.currentTime };
@@ -222,13 +156,11 @@
     for (let i = 0; i < v.nodes.length; i++) {
       const n = v.nodes[i];
       if ('onended' in n) n.onended = null;
-      try { n.disconnect(); } catch (e) { /* já solto */ }
+      try { n.disconnect(); } catch (e) {   }
     }
-    try { v.out.disconnect(); } catch (e) { /* já solto */ }
+    try { v.out.disconnect(); } catch (e) {   }
     v.nodes.length = 0;
   }
-  // Tira uma voz de cena com fade de 20 ms (sem clique). A limpeza garante a desmontagem mesmo se
-  // alguma fonte agendada para o futuro nunca disparar onended.
   function kill(v, t) {
     if (v.dead || v.dying) return;
     v.dying = true;
@@ -236,22 +168,17 @@
     g.cancelScheduledValues(t); g.setValueAtTime(v.level, t); g.linearRampToValueAtTime(0, t + 0.02);
     for (let i = 0; i < v.nodes.length; i++) {
       const n = v.nodes[i];
-      if (typeof n.stop === 'function') { try { n.stop(t + 0.03); } catch (e) { /* já parou */ } }
+      if (typeof n.stop === 'function') { try { n.stop(t + 0.03); } catch (e) {   } }
     }
     if (global.setTimeout) global.setTimeout(function () { free(v); }, 150);
   }
-
-  // Envelopes. Todo nó de envelope nasce com ganho 0: com o ganho padrão (1), a fonte que começa no meio
-  // de uma amostra vaza uma amostra cheia antes do primeiro evento de automação — e isso é um clique.
   function pluck(p, t, peak, atk, tau) { p.setValueAtTime(0, t); p.linearRampToValueAtTime(peak, t + atk); p.setTargetAtTime(0, t + atk, tau); }
-  // Rajada de ruído filtrado que cai com constante tau. Devolve o filtro (para varreduras).
   function burst(v, t, type, f, q, peak, tau, salt) {
     const ctx = v.ctx, n = noise(v, t, t + 0.002 + tau * 9, salt), fl = node(v, bq(ctx, type, f, q)), e = node(v, gainNode(ctx, 0));
     pluck(e.gain, t, peak, 0.001, tau);
     n.connect(fl); fl.connect(e); e.connect(v.out);
     return fl;
   }
-  // Tom com queda de afinação (bumbo, baques, cliques).
   function thump(v, t, f0, f1, glide, peak, tau, type) {
     const o = osc(v, type || 'sine', f0, t, t + 0.004 + tau * 9);
     o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + glide);
@@ -260,7 +187,6 @@
     o.connect(e); e.connect(v.out);
     return o;
   }
-  // Nota que segura: ataque, sustenta e solta.
   function held(v, type, f, t, dur, peak, atk, rel, dest) {
     const o = osc(v, type, f, t, t + dur + rel * 9), e = node(v, gainNode(v.ctx, 0));
     e.gain.setValueAtTime(0, t); e.gain.linearRampToValueAtTime(peak, t + atk);
@@ -268,16 +194,10 @@
     o.connect(e); e.connect(dest || v.out);
     return o;
   }
-
-  /* ------------------------------------------------------------------ */
-  /* Instrumentos                                                        */
-  /* ------------------------------------------------------------------ */
-
-  // Piano elétrico: FM 1:1 com índice que cai rápido (o "latido" do ataque) + triângulo levemente desafinado.
   function epTone(v, t, midi, dur, vel, level) {
     const ctx = v.ctx, f = hz(midi), tEnd = t + Math.max(0.05, dur), tStop = tEnd + 0.9;
     const car = osc(v, 'sine', f, t, tStop), mod = osc(v, 'sine', f, t, tStop), idx = node(v, gainNode(ctx, 0));
-    idx.gain.setValueAtTime(f * (1 + 1.1 * vel), t);     // tocar mais forte = ataque mais brilhante
+    idx.gain.setValueAtTime(f * (1 + 1.1 * vel), t);
     idx.gain.setTargetAtTime(f * 0.38, t, 0.18);
     mod.connect(idx); idx.connect(car.frequency);
     const tri = osc(v, 'triangle', f, t, tStop), triG = node(v, gainNode(ctx, 0.3));
@@ -290,7 +210,6 @@
     env.gain.setTargetAtTime(0, tEnd, 0.13);
     car.connect(env); triG.connect(env); env.connect(v.out);
   }
-  // Lead de chip: pulso de 25% com filtro que fecha depressa e vibrato que chega atrasado nas notas longas.
   function leadTone(v, t, midi, dur, vel, level, vibrato) {
     const ctx = v.ctx, tEnd = t + Math.max(0.04, dur), tStop = tEnd + 0.35;
     const o = osc(v, 'pulse', hz(midi), t, tStop), lp = node(v, bq(ctx, 'lowpass', 2600, 0.8));
@@ -307,7 +226,6 @@
     env.gain.setTargetAtTime(0, tEnd, 0.035);
     o.connect(lp); lp.connect(env); env.connect(v.out);
   }
-  // Baixo redondo: senoide + um pouco de triângulo + a oitava baixinha (para aparecer em alto-falante pequeno).
   function bassTone(v, t, midi, dur, vel) {
     const ctx = v.ctx, f = hz(midi), tEnd = t + Math.max(0.05, dur), tStop = tEnd + 0.35;
     const env = node(v, gainNode(ctx, 0)), peak = BASS_LEVEL * vel;
@@ -320,14 +238,11 @@
     const oct = osc(v, 'sine', f * 2, t, tStop), og = node(v, gainNode(ctx, 0.45)); oct.connect(og); og.connect(env);
     env.connect(v.out);
   }
-  // Bumbo macio: senoide que despenca de 120 a 46 Hz, um "toc" curto em 150 Hz (para aparecer em
-  // alto-falante de notebook) e um toquinho de ruído abafado.
   function kickTone(v, s, t, vel) {
     thump(v, t, 120, 46, 0.13, KICK_LEVEL * vel, 0.11);
     thump(v, t, 170, 140, 0.03, KICK_LEVEL * 0.3 * vel, 0.03);
     burst(v, t, 'lowpass', 1400, 0.7, KICK_LEVEL * 0.09 * vel, 0.004, s * 3 + 1);
   }
-  // Aro: o "toc" de madeira (duas ressonâncias curtas) + ruído agudo + um rabinho de caixa bem baixo.
   function rimTone(v, s, t, vel) {
     const k = RIM_LEVEL * vel;
     thump(v, t, 1750, 1650, 0.01, 0.07 * k, 0.009);
@@ -335,17 +250,10 @@
     burst(v, t, 'bandpass', 3000, 0.9, 0.09 * k, 0.012, s * 5 + 2);
     burst(v, t, 'lowpass', 3800, 0.5, 0.025 * k, 0.05, s * 7 + 3);
   }
-  // Chimbal: ruído passa-alta. Aberto, ele demora mais a sumir.
   function hatTone(v, s, t, vel, open) {
     burst(v, t, 'highpass', 5500, 0.7, HAT_LEVEL * vel, open ? 0.085 : 0.018, s * 11 + 4);
   }
-
-  /* ------------------------------------------------------------------ */
-  /* O sequenciador: o que toca em cada semicolcheia                     */
-  /* ------------------------------------------------------------------ */
-
   function mv(E, dest) { return voice(E, dest, E.musicVoices); }
-
   function playStep(E, s, t) {
     const ls = s % LOOP_STEPS, arr = arrangement(Math.floor(s / LOOP_STEPS));
     const bar = ls >> 4, pos = ls & 15, B = BARS[bar];
@@ -356,11 +264,10 @@
     if (arr === 3 && pos === 0 && bar === 8) E.tone.frequency.setTargetAtTime(2600, t, 0.9);
     if (arr === 3 && pos === 0 && bar === 10) E.tone.frequency.setTargetAtTime(TONE_HZ, t, 1.4);
   }
-
   function drums(E, s, t, bar, pos, arr) {
     const r = function (k) { return hash(s * 53 + k); };
-    const jit = function (k) { return (r(k) - 0.5) * 0.006; };   // ±3 ms: mão humana, não metrônomo
-    if (arr === 0 && bar < 2) {       // introdução: só piano; no fim do 2º compasso o chimbal anuncia a entrada
+    const jit = function (k) { return (r(k) - 0.5) * 0.006; };
+    if (arr === 0 && bar < 2) {
       if (bar === 1 && pos >= 12 && pos % 2 === 0) hatTone(mv(E, E.hatIn), s, t, 0.3 + 0.1 * (pos - 12), false);
       return;
     }
@@ -378,7 +285,6 @@
       hatTone(mv(E, E.hatIn), s, t + jit(7), 0.22, false);
     }
   }
-
   function bass(E, s, t, bar, pos, arr, B) {
     const pat = arr === 2 && bar >= 8 && bar < 12 ? BASS_LONG : BASS;
     for (let i = 0; i < pat.length; i++) {
@@ -387,7 +293,7 @@
       const root = B.b;
       let m = root;
       if (p[2] === 'q') m = root + 7 > 47 ? root - 5 : root + 7;
-      else if (p[2] === 'a') {      // meio tom antes da próxima fundamental, vindo do lado de onde o baixo está
+      else if (p[2] === 'a') {
         const nb = BARS[(bar + 1) % LOOP_BARS].b;
         if (nb === root) continue;
         m = nb + (nb > root ? -1 : 1);
@@ -395,17 +301,15 @@
       bassTone(mv(E, E.bassIn), t, m, p[1] * STEP - 0.03, p[3] * (0.92 + 0.12 * hash(s * 17 + 5)));
     }
   }
-
   function epChord(E, s, t, notes, lenSteps, vel) {
     const dur = lenSteps * STEP - 0.02;
     for (let i = 0; i < notes.length; i++) {
-      const j = hash(s * 31 + i * 7 + 3), dt = i * 0.012 + j * 0.006;   // dedilhado leve, de baixo para cima
+      const j = hash(s * 31 + i * 7 + 3), dt = i * 0.012 + j * 0.006;
       epTone(mv(E, E.epIn), t + dt - WOW_DELAY, notes[i], dur - dt, vel * (0.82 + 0.06 * i) * (0.93 + 0.1 * j), EP_LEVEL);
     }
   }
-
   function piano(E, s, t, bar, pos, arr, B) {
-    if (arr === 2 && bar >= 8 && bar < 12) {     // a quebra: o piano dedilha o acorde em colcheias
+    if (arr === 2 && bar >= 8 && bar < 12) {
       if (pos === 0) epChord(E, s, t, B.c, 15, 0.32);
       if (pos % 2 === 0) {
         const n = B.c[ARP[pos >> 1]] + (pos === 6 ? 12 : 0);
@@ -419,7 +323,6 @@
       if (p[0] === pos) epChord(E, s, t, p[0] >= 8 && B.c2 ? B.c2 : B.c, p[1], p[2] * (arr === 0 && bar < 2 ? 0.85 : 1));
     }
   }
-
   function lead(E, s, t, bar, pos, arr) {
     const start = bar - (bar % 4), name = PLAN[arr][start];
     if (!name) return;
@@ -429,8 +332,6 @@
       if (n[0] === pos) leadTone(mv(E, E.leadIn), t - WOW_DELAY, n[1], n[2] * STEP * 0.92, 0.85 + 0.15 * hash(s * 11 + 2), LEAD_LEVEL);
     }
   }
-
-  // Vinil: chiado contínuo + estalinhos esparsos, em laço (o buffer começa e termina em silêncio).
   function vinyl(E, t) {
     const ctx = E.ctx, v = mv(E, E.vinylIn), far = t + 36000;
     const hiss = ctx.createBufferSource(); hiss.buffer = E.noise; hiss.loop = true;
@@ -442,16 +343,8 @@
     cr.connect(cf); cf.connect(cl); cl.connect(cg); cg.connect(v.out);
     src(v, cr, t, far, 0);
   }
-
-  /* ------------------------------------------------------------------ */
-  /* Efeitos                                                             */
-  /* ------------------------------------------------------------------ */
-
   function chip(v, t, midi, dur, level, vibrato) { leadTone(v, t, midi, dur, 1, level, !!vibrato); }
-
   const SFX = {
-    // Botão: estalo + baque + o "tec" de volta; depois o CRT esquentando (zumbido de 60 Hz que cresce e
-    // some, estática da tela carregando e o agudo do flyback bem baixinho).
     power: function (E, v, t) {
       const ctx = v.ctx;
       burst(v, t, 'bandpass', 2300, 1.1, 0.4, 0.004, 11);
@@ -469,26 +362,22 @@
       we.gain.setValueAtTime(0, t + 0.1); we.gain.linearRampToValueAtTime(0.01, t + 0.4); we.gain.setTargetAtTime(0, t + 0.6, 0.3);
       wh.connect(we); we.connect(v.out);
     },
-    // O bipe do POST: onda quadrada de 1 kHz, como o alto-falante interno do PC.
     beep: function (E, v, t) {
       const lp = node(v, bq(v.ctx, 'lowpass', 3800, 0.7)); lp.connect(v.out);
       held(v, 'square', 1000, t, 0.16, 0.08, 0.003, 0.008, lp);
     },
-    // Tecla mecânica: o "clac" do topo, o "toc" do fundo e a volta. Cada chamada muda um pouco.
     key: function (E, v, t, k) {
       const a = hash(k * 3 + 1), b = hash(k * 5 + 2), c = hash(k * 7 + 3), lvl = 0.8 + 0.4 * a;
       burst(v, t, 'bandpass', 2600 + 1800 * b, 1.3, 0.16 * lvl, 0.006, k * 13 + 1);
       thump(v, t, 230 * (0.9 + 0.2 * c), 150, 0.03, 0.12 * lvl, 0.012);
       burst(v, t + 0.008 + 0.008 * c, 'highpass', 1800, 0.7, 0.07 * lvl, 0.004, k * 17 + 2);
     },
-    // O desktop aparece: Cmaj9 dedilhado no piano elétrico e duas notinhas de chip lá em cima.
     boot: function (E, v, t) {
       const notes = [48, 55, 59, 62, 64];
       for (let i = 0; i < notes.length; i++) epTone(v, t + i * 0.05, notes[i], 1.15 - i * 0.05, 0.9, 0.05);
       chip(v, t + 0.3, 79, 0.1, 0.045);
       chip(v, t + 0.42, 84, 0.3, 0.04, true);
     },
-    // Desligar o CRT: o "pop", o chiado que despenca de 5 kHz a 250 Hz e o resto do zumbido morrendo.
     off: function (E, v, t) {
       const ctx = v.ctx;
       thump(v, t, 85, 36, 0.07, 0.45, 0.05);
@@ -502,12 +391,10 @@
       pluck(he.gain, t, 0.12, 0.005, 0.09);
       osc(v, 'sawtooth', 60, t, t + 0.9).connect(hl); hl.connect(he); he.connect(v.out);
     },
-    // Clique de interface: um tique de triângulo que cai de afinação e um fiapo de ruído.
     click: function (E, v, t, k) {
       thump(v, t, 2200, 1300, 0.012, 0.11, 0.008, 'triangle');
       burst(v, t, 'bandpass', 4200, 1.2, 0.07, 0.0025, k * 19 + 3);
     },
-    // Erro: dois bipes graves descendo (Mi → Dó), cada um com duas quadradas quase iguais ("não-não").
     error: function (E, v, t) {
       const lp = node(v, bq(v.ctx, 'lowpass', 2000, 0.8)); lp.connect(v.out);
       const parts = [[0, 0.11, 330], [0.14, 0.22, 262]];
@@ -517,7 +404,6 @@
         held(v, 'square', p[2] * 1.006, t + p[0], p[1], 0.035, 0.004, 0.012, lp);
       }
     },
-    // Recorde no jogo: arpejo de chip subindo em Dó, um acorde que fica com vibrato e um brilhinho.
     win: function (E, v, t) {
       const ctx = v.ctx, run = [[0, 72], [0.075, 76], [0.15, 79]];
       for (let i = 0; i < run.length; i++) chip(v, t + run[i][0], run[i][1], 0.07, 0.07);
@@ -533,11 +419,6 @@
       }
     }
   };
-
-  /* ------------------------------------------------------------------ */
-  /* O motor: o grafo inteiro num contexto (ao vivo ou offline)          */
-  /* ------------------------------------------------------------------ */
-
   function pulseWave(ctx, duty) {
     const N = 40, re = new Float32Array(N), im = new Float32Array(N);
     for (let n = 1; n < N; n++) {
@@ -551,7 +432,6 @@
     for (let i = 0; i < n; i++) d[i] = r() * 2 - 1;
     return b;
   }
-  // Estalinhos de vinil: impulsos curtos e esparsos, longe das pontas (o laço emenda em silêncio).
   function crackleBuffer(ctx, seconds, seed) {
     const sr = ctx.sampleRate, n = Math.floor(sr * seconds), b = ctx.createBuffer(1, n, sr), d = b.getChannelData(0), r = rng(seed);
     const count = Math.floor(seconds * 7);
@@ -562,27 +442,18 @@
     }
     return b;
   }
-
   function buildEngine(ctx) {
     const E = { ctx: ctx, musicVoices: new Set(), sfxVoices: new Set(), M: { running: false, step: 0, t0: 0 } };
     const g = function (v) { return gainNode(ctx, v); };
-
-    // Saída: mistura → volume → limitador (só age acima de −6 dBFS: soma rara de efeito com pico da
-    // música) → desfaz o ganho de compensação que o DynamicsCompressor sempre aplica → liga/desliga.
-    // Um compressor que trabalha o tempo todo "incha" notas sustentadas (o bipe crescia 4 dB): aqui não.
     E.out = g(0);
     const mix = g(1), pre = g(OUT_TRIM), comp = ctx.createDynamicsCompressor(), post = g(LIMITER_MAKEUP_UNDO);
     comp.threshold.value = -6; comp.knee.value = 4; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.15;
     mix.connect(pre); pre.connect(comp); comp.connect(post); post.connect(E.out);
     E.mix = mix; E.outTrim = OUT_TRIM;
-
-    // Música: tudo soma em musicBus → corta subgrave → teto quente → fade da música.
     E.musicGain = g(0); E.musicGain.connect(mix);
     E.tone = bq(ctx, 'lowpass', TONE_HZ, 0.5); E.tone.connect(E.musicGain);
     const hp = bq(ctx, 'highpass', 32, 0.7); hp.connect(E.tone);
     E.musicBus = g(1); E.musicBus.connect(hp);
-
-    // Wow de fita: duas linhas de atraso moduladas — juntas (a fita) e em fases opostas (o coro estéreo).
     const wowIn = g(1), dl = ctx.createDelay(0.05), dr = ctx.createDelay(0.05), merge = ctx.createChannelMerger(2);
     dl.delayTime.value = WOW_DELAY; dr.delayTime.value = WOW_DELAY;
     wowIn.connect(dl); wowIn.connect(dr); dl.connect(merge, 0, 0); dr.connect(merge, 0, 1); merge.connect(E.musicBus);
@@ -590,22 +461,16 @@
     wow.frequency.value = 0.31; wow.connect(wowL); wow.connect(wowR); wowL.connect(dl.delayTime); wowR.connect(dr.delayTime);
     const cho = ctx.createOscillator(), choL = g(0.0004), choR = g(-0.0004);
     cho.frequency.value = 0.9; cho.connect(choL); cho.connect(choR); choL.connect(dl.delayTime); choR.connect(dr.delayTime);
-
-    // Eco de colcheia pontuada, filtrado para não embolar (piano e lead mandam um pouco).
     const echoIn = g(1), dly = ctx.createDelay(2), fb = g(0.3), eLP = bq(ctx, 'lowpass', 2300, 0.5), eHP = bq(ctx, 'highpass', 280, 0.5), eOut = g(0.5), ePan = panner(ctx, -0.3);
     dly.delayTime.value = BEAT * 0.75;
     echoIn.connect(dly); dly.connect(eLP); eLP.connect(eHP); eHP.connect(fb); fb.connect(dly); eHP.connect(eOut); eOut.connect(ePan); ePan.connect(E.musicBus);
-
-    // Piano: tremolo leve → filtro → wow (+ eco)
     E.epIn = g(1);
     const trem = g(0.88), tremLfo = ctx.createOscillator(), tremDepth = g(0.12), epLP = bq(ctx, 'lowpass', 4200, 0.6), epSend = g(0.18);
     tremLfo.frequency.value = 4.4; tremLfo.connect(tremDepth); tremDepth.connect(trem.gain);
     E.epIn.connect(trem); trem.connect(epLP); epLP.connect(wowIn); epLP.connect(epSend); epSend.connect(echoIn);
-    // Lead → wow (+ mais eco)
     E.leadIn = g(1);
     const leadSend = g(0.4);
     E.leadIn.connect(wowIn); E.leadIn.connect(leadSend); leadSend.connect(echoIn);
-    // Baixo, bateria e vinil
     E.bassIn = g(1);
     const bLP = bq(ctx, 'lowpass', 900, 0.6); E.bassIn.connect(bLP); bLP.connect(E.musicBus);
     E.drumIn = g(1); E.drumIn.connect(E.musicBus);
@@ -613,24 +478,17 @@
     E.hatIn = panner(ctx, 0.22); E.hatIn.connect(E.drumIn);
     E.rimIn = panner(ctx, -0.12); E.rimIn.connect(E.drumIn);
     E.vinylIn = g(1); E.vinylIn.connect(E.musicBus);
-
-    // Efeitos: barramento próprio (fora do fade da música) e um eco curto só deles.
     E.sfxIn = g(1); E.sfxIn.connect(mix);
     E.sfxEcho = g(1);
     const sd = ctx.createDelay(1), sfb = g(0.22), sLP = bq(ctx, 'lowpass', 3000, 0.5), sOut = g(0.3);
     sd.delayTime.value = 0.13;
     E.sfxEcho.connect(sd); sd.connect(sLP); sLP.connect(sfb); sfb.connect(sd); sLP.connect(sOut); sOut.connect(mix);
-
-    // Formas de onda e ruídos, gerados uma vez com semente fixa.
     E.pulse = pulseWave(ctx, 0.25);
     E.noise = noiseBuffer(ctx, 2, 1234);
     E.crackle = crackleBuffer(ctx, 4.3, 99);
-
     E.lfos = [wow, cho, tremLfo];
     const t = ctx.currentTime;
     E.lfos.forEach(function (o) { o.start(t); });
-
-    // Começa a trilha em t, a partir da semicolcheia startStep, com fade de entrada.
     E.musicStart = function (t0, startStep, fade) {
       const M = E.M;
       M.running = true; M.step = startStep | 0; M.t0 = t0 + 0.05 - stepOffset(M.step);
@@ -639,8 +497,6 @@
       mg.cancelScheduledValues(t0); mg.setValueAtTime(0, t0); mg.linearRampToValueAtTime(1, t0 + Math.max(0.01, fade || 0));
       vinyl(E, t0);
     };
-    // Agenda tudo o que começa antes de tEnd. Se o relógio passou da grade (timer congelado em segundo
-    // plano sem setPaused), a grade é empurrada para frente: nada de despejar as notas perdidas de uma vez.
     E.musicSchedule = function (tEnd, now) {
       const M = E.M;
       if (!M.running) return;
@@ -664,29 +520,22 @@
     };
     E.dispose = function () {
       E.M.running = false;
-      E.lfos.forEach(function (o) { try { o.stop(); } catch (e) { /* já parado */ } });
+      E.lfos.forEach(function (o) { try { o.stop(); } catch (e) {   } });
       E.musicVoices.forEach(free); E.sfxVoices.forEach(free);
-      try { E.out.disconnect(); } catch (e) { /* já solto */ }
+      try { E.out.disconnect(); } catch (e) {   }
     };
     return E;
   }
-
-  /* ------------------------------------------------------------------ */
-  /* A API ao vivo                                                       */
-  /* ------------------------------------------------------------------ */
-
   function readOn(key) {
     try { return global.localStorage.getItem(key) !== '0'; } catch (e) { return true; }
   }
   function saveOn(key, on) {
-    try { global.localStorage.setItem(key, on ? '1' : '0'); } catch (e) { /* sem storage: vale só nesta visita */ }
+    try { global.localStorage.setItem(key, on ? '1' : '0'); } catch (e) {   }
   }
-  // Rampa a partir do valor atual (sem degrau, mesmo no meio de outra rampa).
   function rampTo(p, target, t, dur) {
     const cur = p.value;
     p.cancelScheduledValues(t); p.setValueAtTime(cur, t); p.linearRampToValueAtTime(target, t + dur);
   }
-
   function create(opts) {
     opts = opts || {};
     const key = opts.storageKey || 'andreyos.som';
@@ -696,51 +545,42 @@
     let wantMusic = false, musicOn = false, stopping = false;
     let tick = 0, killTimer = 0, offTimer = 0, pausedFlag = false;
     let rev = 0, chain = Promise.resolve(), sfxCount = 0;
-
     const paused = function () { return pausedFlag || !!(doc && doc.hidden); };
     const live = function () { return !!E && unlocked && on && !paused() && !disposed; };
     const warn = function (e) { if (global.console) console.warn('AndreyAudio: não deu para atualizar o áudio.', e); };
-
     function startTick() {
       if (tick || !musicOn) return;
       tick = global.setInterval(step, TICK_MS);
       step();
     }
     function stopTick() { if (tick) { global.clearInterval(tick); tick = 0; } }
-    // Agenda o que vem pela frente. Continua andando durante o fade de desligar/pausar (até o contexto
-    // suspender), para a grade não abrir buraco; com o contexto parado, não faz nada.
     function step() {
       if (!E || disposed || !musicOn || ctx.state !== 'running') return;
       const now = ctx.currentTime;
       E.musicSchedule(now + LOOKAHEAD, now);
     }
-
     function killMusic() {
       if (killTimer) { global.clearTimeout(killTimer); killTimer = 0; }
       stopTick(); stopping = false;
       if (musicOn) { musicOn = false; E.musicStop(ctx.currentTime); }
     }
-    // Faz a música bater com o que foi pedido. Só roda com o contexto andando.
     function syncMusic() {
       if (!live()) return;
       const now = ctx.currentTime;
       if (wantMusic) {
         if (!musicOn) { E.musicStart(now + 0.02, 0, FADE_MUSIC_IN); musicOn = true; stopping = false; }
-        else if (stopping) {            // pediram de novo no meio do fade de saída: só volta o volume
+        else if (stopping) {
           stopping = false;
           if (killTimer) { global.clearTimeout(killTimer); killTimer = 0; }
           rampTo(E.musicGain.gain, 1, now, FADE_MUSIC_OUT);
         }
         startTick();
       } else if (musicOn && !stopping) {
-        stopping = true;                // o agendador segue durante o fade, para não abrir buraco
+        stopping = true;
         rampTo(E.musicGain.gain, 0, now, FADE_MUSIC_OUT);
         killTimer = global.setTimeout(function () { killTimer = 0; if (stopping) killMusic(); }, FADE_MUSIC_OUT * 1000 + 70);
       }
     }
-
-    // Reconcilia contexto, volume geral e agendador com o estado (ligado, pausado, liberado).
-    // As transições são enfileiradas: um suspend atrasado nunca vence o último resume.
     function reconcile() {
       if (!E || disposed) return chain;
       const r = ++rev, now = ctx.currentTime;
@@ -752,7 +592,7 @@
           return ctx.resume();
         }).then(function () { if (r === rev) syncMusic(); }).catch(warn);
       } else {
-        const fade = on ? 0.05 : FADE_ONOFF;     // aba oculta: corte rápido; desligar: fade de 300 ms
+        const fade = on ? 0.05 : FADE_ONOFF;
         rampTo(E.out.gain, 0, now, fade);
         if (!wantMusic && musicOn) killMusic();
         offTimer = global.setTimeout(function () {
@@ -767,30 +607,25 @@
       }
       return chain;
     }
-
     function onVisibility() { if (E) reconcile(); }
     if (doc && doc.addEventListener) doc.addEventListener('visibilitychange', onVisibility);
-
     function unlock() {
       if (disposed || !AC) return;
       if (!ctx) {
         try { ctx = opts.contextOptions ? new AC(opts.contextOptions) : new AC(); } catch (e) { ctx = null; warn(e); return; }
         E = buildEngine(ctx);
         E.out.connect(ctx.destination);
-        // iOS antigo só libera o áudio depois de tocar algo dentro do gesto: um buffer mudo de 1 amostra.
         try {
           const b = ctx.createBuffer(1, 1, ctx.sampleRate), s = ctx.createBufferSource();
           s.buffer = b; s.connect(ctx.destination); s.start(0);
-        } catch (e) { /* sem problema */ }
+        } catch (e) {   }
       }
       unlocked = true;
-      // O resume precisa ser pedido aqui, ainda dentro do gesto (Safari).
       if (live() && ctx.state !== 'running' && ctx.state !== 'closed') {
-        try { const p = ctx.resume(); if (p && p.catch) p.catch(noop); } catch (e) { /* tenta de novo no reconcile */ }
+        try { const p = ctx.resume(); if (p && p.catch) p.catch(noop); } catch (e) {   }
       }
       reconcile();
     }
-
     function setOn(value) {
       if (disposed) return on;
       on = !!value;
@@ -798,17 +633,13 @@
       reconcile();
       return on;
     }
-
     function music(play) {
       if (disposed) return;
       wantMusic = !!play;
       if (!E) return;
       if (live()) syncMusic();
-      else if (!wantMusic && musicOn) killMusic();   // parada com o som suspenso: não há fade a esperar
+      else if (!wantMusic && musicOn) killMusic();
     }
-
-    // Abre espaço para um efeito novo: no máximo N do mesmo nome e 8 no total (a mais velha sai com fade).
-    // Devolve false se o mesmo efeito acabou de começar (chamada repetida no mesmo instante).
     function limit(name, now) {
       const same = [], all = [], gap = SFX_MIN_GAP[name] || SFX_MIN_GAP_DEFAULT;
       let recent = false;
@@ -830,17 +661,14 @@
         if (limit(name, now)) E.sfx(name, now + 0.005, ++sfxCount);
       };
       if (ctx.state === 'running') { fire(); return; }
-      // Logo depois do unlock o contexto ainda está retomando: toca quando ele andar, se ainda fizer sentido.
       const r = rev, asked = Date.now();
       chain.then(function () { if (r === rev && live() && ctx.state === 'running' && Date.now() - asked < 600) fire(); });
     }
-
     function setPaused(p) {
       if (disposed) return;
       pausedFlag = !!p;
       reconcile();
     }
-
     function dispose() {
       if (disposed) return;
       disposed = true; rev++;
@@ -850,10 +678,9 @@
       if (doc && doc.removeEventListener) doc.removeEventListener('visibilitychange', onVisibility);
       if (E) E.dispose();
       musicOn = false; stopping = false;
-      if (ctx && ctx.close) { try { const p = ctx.close(); if (p && p.catch) p.catch(noop); } catch (e) { /* já fechado */ } }
+      if (ctx && ctx.close) { try { const p = ctx.close(); if (p && p.catch) p.catch(noop); } catch (e) {   } }
       ctx = null; E = null;
     }
-
     return {
       unlock: unlock,
       setOn: setOn,
@@ -874,13 +701,11 @@
       }
     };
   }
-
   global.AndreyAudio = {
     create: create,
     BPM: BPM,
     LOOP_SECONDS: LOOP_SECONDS,
     SFX: Object.keys(SFX),
-    // Só para o harness de dev/: o mesmo grafo num contexto qualquer (ex.: OfflineAudioContext).
     _engine: buildEngine,
     _stepOffset: stepOffset
   };
